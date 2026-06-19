@@ -45,6 +45,14 @@
 .PARAMETER After
     Optional. Only CVEs made public on/after this date (speeds up large sweeps).
 
+.PARAMETER Before
+    Optional. Only CVEs made public on/before this date.
+
+.PARAMETER LastMonth
+    Convenience switch: sets a rolling one-month public-date window ending today
+    (equivalent to -After (today-1 month) -Before today). Explicit -After/-Before
+    override the corresponding bound.
+
 .PARAMETER OnlyUnpatched
     Output only CVEs with NO errata for the requested version (the live risk backlog).
 
@@ -71,6 +79,10 @@
 .EXAMPLE
     .\Get-RhelCveErrata.ps1 -RhelVersion 9 -Severity important -Package kernel -After 2025-01-01
 
+.EXAMPLE
+    # Critical CVEs with a patch available, published in the last month:
+    .\Get-RhelCveErrata.ps1 -RhelVersion 9.6 -Severity critical -LastMonth -OnlyWithPatch
+
 .NOTES
     Source of truth : Red Hat Security Data API (public, no auth required)
     Vendor severity : threat_severity field (the ISM-1696 relevant rating)
@@ -88,6 +100,10 @@ param(
     [string]$Package,
 
     [datetime]$After,
+
+    [datetime]$Before,
+
+    [switch]$LastMonth,
 
     [switch]$OnlyUnpatched,
 
@@ -113,6 +129,13 @@ $Major = ($RhelVersion -split '\.')[0]
 $Minor = if ($RhelVersion -match '\.') { ($RhelVersion -split '\.')[1] } else { $null }
 
 if ($Major -notmatch '^\d+$') { throw "Invalid -RhelVersion '$RhelVersion'. Expected forms: '9' or '9.6'." }
+
+# Last-month convenience: set a rolling 1-month public-date window ending today,
+# unless the caller already supplied explicit -After / -Before bounds.
+if ($LastMonth) {
+    if (-not $PSBoundParameters.ContainsKey('After'))  { $After  = (Get-Date).AddMonths(-1) }
+    if (-not $PSBoundParameters.ContainsKey('Before')) { $Before = (Get-Date) }
+}
 
 # ---------------------------------------------------------------------------
 # HTTP wrapper with retry/backoff for rate limiting and transient errors
@@ -181,9 +204,12 @@ $qsParts = @(
 )
 if ($Package) { $qsParts += "package=$([uri]::EscapeDataString($Package))" }
 if ($After)   { $qsParts += "after=$($After.ToString('yyyy-MM-dd'))" }
+if ($Before)  { $qsParts += "before=$($Before.ToString('yyyy-MM-dd'))" }
 $qs = $qsParts -join '&'
 
 Write-Host "Querying RHEL $RhelVersion / severity=$Severity CVEs from Red Hat Security Data API..." -ForegroundColor Cyan
+Write-Host "API query URL:" -ForegroundColor DarkCyan
+Write-Host "  $script:ApiBase/cve.json?$qs" -ForegroundColor DarkGray
 
 $perPage = 1000
 $page    = 1
