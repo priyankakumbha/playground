@@ -188,12 +188,27 @@ Write-Host "Querying RHEL $RhelVersion / severity=$Severity CVEs from Red Hat Se
 $perPage = 1000
 $page    = 1
 $list    = [System.Collections.Generic.List[object]]::new()
-do {
-    $uri   = "$script:ApiBase/cve.json?$qs&per_page=$perPage&page=$page"
-    $batch = @(Invoke-RhSecApi -Uri $uri)
-    foreach ($c in $batch) { if ($c) { $list.Add($c) } }
+while ($true) {
+    $uri  = "$script:ApiBase/cve.json?$qs&per_page=$perPage&page=$page"
+    $resp = Invoke-RhSecApi -Uri $uri
+
+    # Add each CVE record individually. Flatten one level defensively so that an
+    # Invoke-RestMethod result of either "array of records" OR "single object that
+    # is itself the whole array" both land as discrete records (not one blob).
+    $added = 0
+    foreach ($item in $resp) {
+        if ($null -eq $item) { continue }
+        if (($item -is [System.Collections.IEnumerable]) -and ($item -isnot [string])) {
+            foreach ($sub in $item) { if ($null -ne $sub) { $list.Add($sub); $added++ } }
+        }
+        else {
+            $list.Add($item); $added++
+        }
+    }
+
+    if ($added -lt $perPage) { break }   # last (partial) page reached
     $page++
-} while ($batch.Count -eq $perPage)
+}
 
 Write-Host ("Found {0} CVE(s) at the RHEL {1} major-stream level. " -f $list.Count, $Major) -ForegroundColor Cyan -NoNewline
 if ($Fast) { Write-Host "(Fast mode: no per-CVE detail.)" -ForegroundColor DarkYellow }
@@ -207,7 +222,11 @@ $i = 0
 
 foreach ($cve in $list) {
     $i++
-    $cveId = $cve.CVE
+    $cveId = "$($cve.CVE)"
+    if ([string]::IsNullOrWhiteSpace($cveId) -or $cveId -match '\s') {
+        Write-Warning "Skipping malformed record (CVE id = '$cveId')."
+        continue
+    }
     Write-Progress -Activity "Resolving CVEs" -Status "$cveId ($i of $($list.Count))" -PercentComplete (($i / [Math]::Max(1, $list.Count)) * 100)
 
     if ($Fast) {
