@@ -1,0 +1,320 @@
+<#
+.SYNOPSIS
+    Fetches Red Hat Enterprise Linux (RHEL) CVEs filtered by version and vendor
+    severity, and determines for each CVE whether a security errata (RHSA) / patch
+    is available for the requested version, or whether the version is still exposed.
+
+.DESCRIPTION
+    Queries the Red Hat Security Data API
+    (https://access.redhat.com/hydra/rest/securitydata).
+
+    Severity is the VENDOR rating (threat_severity: low | moderate | important |
+    critical) -- NOT a CVSS-derived score. This is the rating Red Hat assigns and
+    the one ISM-1696 keys on for OS patching obligations.
+
+    Patch / errata determination per version:
+      * A CVE is reported "Fixed" for the requested version only if Red Hat's
+        affected_release list contains an entry whose product/CPE matches the
+        version AND carries an advisory (RHSA-xxxx). The fixed package NVR is
+        surfaced from that same entry.
+      * Otherwise the CVE's package_state fix_state for the matching version is
+        reported (Affected | Fix deferred | Will not fix | Under investigation |
+        Out of support scope | Not affected), which means no errata exists yet.
+
+    Version matching rule (transparent by design):
+      * An entry matches if it is the requested RHEL major stream AND either
+        (a) it is the mainline stream with no minor (e.g. enterprise_linux:9), or
+        (b) its minor equals the requested minor (e.g. rhel_eus:9.6).
+      * The matched product_name and CPE are included in the output so you can
+        confirm exactly which stream (mainline vs EUS/E4S/AUS/TUS) the errata
+        came from before treating it as applicable to your hosts.
+
+.PARAMETER RhelVersion
+    RHEL version, e.g. "9", "9.6", "8.10". A bare major ("9") matches every RHEL 9
+    stream. A major.minor ("9.6") matches the mainline stream plus the 9.6 EUS/E4S/
+    AUS/TUS streams. Default: 9.6
+
+.PARAMETER Severity
+    Vendor threat_severity to filter on: low, moderate, important, critical.
+    Default: critical
+
+.PARAMETER Package
+    Optional. Restrict to CVEs affecting a specific package (server-side filter),
+    e.g. "kernel", "openssl", "glibc".
+
+.PARAMETER After
+    Optional. Only CVEs made public on/after this date (speeds up large sweeps).
+
+.PARAMETER OnlyUnpatched
+    Output only CVEs with NO errata for the requested version (the live risk backlog).
+
+.PARAMETER OnlyWithPatch
+    Output only CVEs that HAVE an errata/patch for the requested version.
+
+.PARAMETER Fast
+    List-endpoint only (no per-CVE detail call). Much faster but NOT minor-version
+    precise and cannot report fix_state. Use for a quick major-stream sweep.
+
+.PARAMETER OutputCsv
+    Optional path to also export results as CSV.
+
+.PARAMETER ThrottleMs
+    Delay between per-CVE detail requests (politeness / rate-limit avoidance).
+    Default: 150
+
+.EXAMPLE
+    .\Get-RhelCveErrata.ps1 -RhelVersion 9.6 -Severity critical
+
+.EXAMPLE
+    .\Get-RhelCveErrata.ps1 -RhelVersion 9.6 -Severity critical -OnlyUnpatched -OutputCsv .\rhel96-critical-open.csv
+
+.EXAMPLE
+    .\Get-RhelCveErrata.ps1 -RhelVersion 9 -Severity important -Package kernel -After 2025-01-01
+
+.NOTES
+    Source of truth : Red Hat Security Data API (public, no auth required)
+    Vendor severity : threat_severity field (the ISM-1696 relevant rating)
+    Compatible with : Windows PowerShell 5.1 and PowerShell 7+
+#>
+
+#Requires -Version 5.1
+[CmdletBinding()]
+param(
+    [string]$RhelVersion = '9.6',
+
+    [ValidateSet('low', 'moderate', 'important', 'critical')]
+    [string]$Severity = 'critical',
+
+    [string]$Package,
+
+    [datetime]$After,
+
+    [switch]$OnlyUnpatched,
+
+    [switch]$OnlyWithPatch,
+
+    [switch]$Fast,
+
+    [string]$OutputCsv,
+
+    [int]$ThrottleMs = 150
+)
+
+# ---------------------------------------------------------------------------
+# Setup
+# ---------------------------------------------------------------------------
+$ErrorActionPreference = 'Stop'
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+
+$script:ApiBase   = 'https://access.redhat.com/hydra/rest/securitydata'
+$script:UserAgent = 'RhelCveErrata/1.0 (PowerShell vulnerability triage)'
+
+$Major = ($RhelVersion -split '\.')[0]
+$Minor = if ($RhelVersion -match '\.') { ($RhelVersion -split '\.')[1] } else { $null }
+
+if ($Major -notmatch '^\d+$') { throw "Invalid -RhelVersion '$RhelVersion'. Expected forms: '9' or '9.6'." }
+
+# ---------------------------------------------------------------------------
+# HTTP wrapper with retry/backoff for rate limiting and transient errors
+# ---------------------------------------------------------------------------
+function Invoke-RhSecApi {
+    param([string]$Uri, [int]$MaxRetries = 5)
+
+    $headers = @{ 'User-Agent' = $script:UserAgent; 'Accept' = 'application/json' }
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        try {
+            return Invoke-RestMethod -Uri $Uri -Method Get -Headers $headers -ErrorAction Stop
+        }
+        catch {
+            $status = $null
+            if ($_.Exception.Response) {
+                try { $status = [int]$_.Exception.Response.StatusCode } catch { }
+            }
+            if ($status -eq 429 -and $attempt -le $MaxRetries) {
+                $wait = 5 * $attempt
+                Write-Warning "Rate limited (HTTP 429). Waiting ${wait}s (attempt $attempt/$MaxRetries)..."
+                Start-Sleep -Seconds $wait
+                continue
+            }
+            elseif ($status -ge 500 -and $attempt -le $MaxRetries) {
+                $wait = [int][Math]::Min(30, [Math]::Pow(2, $attempt))
+                Write-Warning "Server error ($status). Backing off ${wait}s (attempt $attempt/$MaxRetries)..."
+                Start-Sleep -Seconds $wait
+                continue
+            }
+            else {
+                throw "Request failed for $Uri : $($_.Exception.Message)"
+            }
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Version matcher: does an affected_release / package_state entry apply to us?
+# ---------------------------------------------------------------------------
+function Test-VersionMatch {
+    param([string]$Cpe, [string]$ProductName, [string]$Major, [string]$Minor)
+
+    $cpe = "$Cpe"; $pn = "$ProductName"
+    $majorRx = ":(enterprise_linux|rhel_eus|rhel_aus|rhel_e4s|rhel_tus|rhel_els):$Major(\b|[:.])"
+    $isMajor = ($cpe -match $majorRx) -or ($pn -match "Red Hat Enterprise Linux $Major(\b|\.)")
+    if (-not $isMajor) { return $false }
+
+    if (-not $Minor) { return $true }   # bare major requested -> any 9.x matches
+
+    $entryMinor = $null
+    if     ($cpe -match ":$Major\.(\d+)")     { $entryMinor = $Matches[1] }
+    elseif ($pn  -match "Linux $Major\.(\d+)") { $entryMinor = $Matches[1] }
+
+    if ($entryMinor) { return ($entryMinor -eq $Minor) }
+    return $true   # mainline stream (no minor in the record) -> applies broadly
+}
+
+# ---------------------------------------------------------------------------
+# Build the list-endpoint query and page through all results
+# ---------------------------------------------------------------------------
+$qsParts = @(
+    "severity=$([uri]::EscapeDataString($Severity.ToLower()))"
+    "product=$([uri]::EscapeDataString("Red Hat Enterprise Linux $Major"))"
+)
+if ($Package) { $qsParts += "package=$([uri]::EscapeDataString($Package))" }
+if ($After)   { $qsParts += "after=$($After.ToString('yyyy-MM-dd'))" }
+$qs = $qsParts -join '&'
+
+Write-Host "Querying RHEL $RhelVersion / severity=$Severity CVEs from Red Hat Security Data API..." -ForegroundColor Cyan
+
+$perPage = 1000
+$page    = 1
+$list    = [System.Collections.Generic.List[object]]::new()
+do {
+    $uri   = "$script:ApiBase/cve.json?$qs&per_page=$perPage&page=$page"
+    $batch = @(Invoke-RhSecApi -Uri $uri)
+    foreach ($c in $batch) { if ($c) { $list.Add($c) } }
+    $page++
+} while ($batch.Count -eq $perPage)
+
+Write-Host ("Found {0} CVE(s) at the RHEL {1} major-stream level. " -f $list.Count, $Major) -ForegroundColor Cyan -NoNewline
+if ($Fast) { Write-Host "(Fast mode: no per-CVE detail.)" -ForegroundColor DarkYellow }
+else       { Write-Host "Resolving per-version errata / fix state..." -ForegroundColor Cyan }
+
+# ---------------------------------------------------------------------------
+# Resolve each CVE
+# ---------------------------------------------------------------------------
+$results = [System.Collections.Generic.List[object]]::new()
+$i = 0
+
+foreach ($cve in $list) {
+    $i++
+    $cveId = $cve.CVE
+    Write-Progress -Activity "Resolving CVEs" -Status "$cveId ($i of $($list.Count))" -PercentComplete (($i / [Math]::Max(1, $list.Count)) * 100)
+
+    if ($Fast) {
+        $errata    = @($cve.advisories) | Where-Object { $_ } | Select-Object -Unique
+        $fixedPkgs = @($cve.affected_packages) | Where-Object { $_ } | Select-Object -Unique
+        $patch     = $errata.Count -gt 0
+        $results.Add([pscustomobject]@{
+            CVE              = $cveId
+            Severity         = $cve.severity
+            CVSS3Score       = $cve.cvss3_score
+            PublicDate       = if ($cve.public_date) { ([datetimeoffset]$cve.public_date).ToString('yyyy-MM-dd') } else { '' }
+            Status           = if ($patch) { 'Fixed (RHEL 9 stream)' } else { 'No errata listed' }
+            PatchAvailable   = $patch
+            Errata           = ($errata -join '; ')
+            FixedPackages    = ($fixedPkgs -join '; ')
+            AffectedPackages = ''
+            FixState         = ''
+            MatchedProducts  = ''
+            MatchedCPEs      = ''
+            CWE              = $cve.CWE
+            CveUrl           = "https://access.redhat.com/security/cve/$cveId"
+            DataSource       = 'list'
+        })
+        continue
+    }
+
+    # Detailed mode: pull the full CVE record
+    if ($ThrottleMs -gt 0) { Start-Sleep -Milliseconds $ThrottleMs }
+    try   { $d = Invoke-RhSecApi -Uri "$script:ApiBase/cve/$cveId.json" }
+    catch { Write-Warning "Could not fetch detail for $cveId : $($_.Exception.Message)"; continue }
+
+    $rel = @($d.affected_release) | Where-Object { $_ }
+    $st  = @($d.package_state)    | Where-Object { $_ }
+
+    $mRel = @($rel | Where-Object { Test-VersionMatch -Cpe $_.cpe -ProductName $_.product_name -Major $Major -Minor $Minor })
+    $mSt  = @($st  | Where-Object { Test-VersionMatch -Cpe $_.cpe -ProductName $_.product_name -Major $Major -Minor $Minor })
+
+    $errata    = @($mRel | ForEach-Object { $_.advisory }     | Where-Object { $_ } | Select-Object -Unique)
+    $fixedPkgs = @($mRel | ForEach-Object { $_.package }       | Where-Object { $_ } | Select-Object -Unique)
+    $affPkgs   = @($mSt  | ForEach-Object { $_.package_name }  | Where-Object { $_ } | Select-Object -Unique)
+    $fixStates = @($mSt  | ForEach-Object { $_.fix_state }     | Where-Object { $_ } | Select-Object -Unique)
+    $products  = @(($mRel + $mSt) | ForEach-Object { $_.product_name } | Where-Object { $_ } | Select-Object -Unique)
+    $cpes      = @(($mRel + $mSt) | ForEach-Object { $_.cpe }          | Where-Object { $_ } | Select-Object -Unique)
+
+    if ($errata.Count -gt 0) {
+        $status = 'Fixed'
+        $patch  = $true
+    }
+    elseif ($mSt.Count -gt 0) {
+        $status = ($fixStates -join '; ')   # e.g. Affected / Fix deferred / Will not fix
+        $patch  = $false
+    }
+    else {
+        $status = 'Not listed for this version'
+        $patch  = $false
+    }
+
+    $results.Add([pscustomobject]@{
+        CVE              = $cveId
+        Severity         = $d.threat_severity
+        CVSS3Score       = $d.cvss3.cvss3_base_score
+        PublicDate       = if ($d.public_date) { ([datetimeoffset]$d.public_date).ToString('yyyy-MM-dd') } else { '' }
+        Status           = $status
+        PatchAvailable   = $patch
+        Errata           = ($errata -join '; ')
+        FixedPackages    = ($fixedPkgs -join '; ')
+        AffectedPackages = ($affPkgs -join '; ')
+        FixState         = ($fixStates -join '; ')
+        MatchedProducts  = ($products -join '; ')
+        MatchedCPEs      = ($cpes -join '; ')
+        CWE              = $d.cwe
+        CveUrl           = "https://access.redhat.com/security/cve/$cveId"
+        DataSource       = 'detail'
+    })
+}
+Write-Progress -Activity "Resolving CVEs" -Completed
+
+# ---------------------------------------------------------------------------
+# Optional filtering
+# ---------------------------------------------------------------------------
+$final = $results
+if ($OnlyWithPatch) { $final = $final | Where-Object { $_.PatchAvailable } }
+if ($OnlyUnpatched) { $final = $final | Where-Object { -not $_.PatchAvailable } }
+$final = $final | Sort-Object PatchAvailable, PublicDate -Descending
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+$patched   = @($results | Where-Object { $_.PatchAvailable }).Count
+$unpatched = $results.Count - $patched
+Write-Host ""
+Write-Host "==================== SUMMARY ====================" -ForegroundColor Green
+Write-Host ("RHEL version    : {0}" -f $RhelVersion)
+Write-Host ("Severity        : {0} (vendor threat_severity)" -f $Severity)
+Write-Host ("Total CVEs      : {0}" -f $results.Count)
+Write-Host ("Errata available: {0}" -f $patched) -ForegroundColor Green
+Write-Host ("No fix yet      : {0}" -f $unpatched) -ForegroundColor $(if ($unpatched) { 'Yellow' } else { 'Green' })
+Write-Host "=================================================" -ForegroundColor Green
+Write-Host ""
+
+# ---------------------------------------------------------------------------
+# CSV export
+# ---------------------------------------------------------------------------
+if ($OutputCsv) {
+    $final | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
+    Write-Host "CSV written: $OutputCsv" -ForegroundColor Cyan
+}
+
+# Emit objects to the pipeline (so you can | Where / | Format-Table / | Export-Csv)
+$final
