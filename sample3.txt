@@ -26,7 +26,10 @@
     token in the file is picked up.
 
 .PARAMETER Product
-    Product stream to scope errata to (substring match on product_name).
+    Product stream to scope errata to. EXACT match on product_name by default, so
+    "Red Hat Enterprise Linux 9" matches only the base stream -- not the EUS / E4S /
+    "Update Services for SAP Solutions" variants. Include * or ? to switch to wildcard
+    matching (e.g. "Red Hat Enterprise Linux 9*" for every 9.x stream).
     Default: "Red Hat Enterprise Linux 9". Ignored with -AllProducts.
 
 .PARAMETER AllProducts
@@ -116,7 +119,11 @@ begin {
     #       Red Hat product names & CPE dictionary https://access.redhat.com/security/data
     function Test-InScope([string]$ProductName) {
         if ($AllProducts) { return $true }
-        "$ProductName" -like "*$Product*"
+        # Exact match by default so "Red Hat Enterprise Linux 9" does NOT also pull in
+        # "...9.6 Extended Update Support" or "...Update Services for SAP Solutions".
+        # Put a * or ? in -Product to opt into wildcard matching instead.
+        if ($Product -match '[*?]') { return ($ProductName -like $Product) }
+        return ($ProductName -eq $Product)
     }
 
     # Build a result row with every column defaulted, then apply overrides.
