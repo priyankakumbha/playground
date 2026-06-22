@@ -1,0 +1,291 @@
+<#
+.SYNOPSIS
+    For a list of CVEs, reports whether a Red Hat errata (RHSA) is available, the
+    errata description, its release date, and how many days have passed since release.
+    Results are written to CSV.
+
+.DESCRIPTION
+    Uses the Red Hat Security Data API (https://access.redhat.com/hydra/rest/securitydata):
+      * /cve/{CVE}.json   -> which RHSAs fix the CVE (per product), the fixed package,
+                             and the fix_state when no fix exists yet.
+      * /csaf/{RHSA}.json  -> the advisory's synopsis, description, aggregate severity,
+                             and authoritative release date.
+
+    CSAF replaces CVRF, which Red Hat has deprecated.
+
+    A CVE may be fixed by more than one RHSA (different RHEL streams). The script scopes
+    to one product (-Product) by default and emits one row per CVE-per-RHSA. CSAF docs
+    are cached so a shared advisory is fetched only once.
+
+.PARAMETER CveId
+    One or more CVE IDs (array, comma list, or pipeline). Tokens are regex-extracted,
+    so messy input is fine.
+
+.PARAMETER InputFile
+    Path to a file of CVEs (plain list or a CSV with a CVE column). Every CVE-XXXX-NNNN
+    token in the file is picked up.
+
+.PARAMETER Product
+    Product stream to scope errata to (substring match on product_name).
+    Default: "Red Hat Enterprise Linux 9". Ignored with -AllProducts.
+
+.PARAMETER AllProducts
+    Report errata from every Red Hat product instead of one stream.
+
+.PARAMETER OutputCsv
+    Output CSV path. Default: .\cve-errata-report.csv
+
+.PARAMETER ThrottleMs
+    Delay between API requests. Default: 150
+
+.EXAMPLE
+    .\Get-CveErrataAge.ps1 -InputFile .\cves.txt -OutputCsv .\report.csv
+
+.EXAMPLE
+    .\Get-CveErrataAge.ps1 -CveId CVE-2024-1086,CVE-2021-44228 -Product "Red Hat Enterprise Linux 8"
+
+.EXAMPLE
+    Get-Content .\scan-export.csv | .\Get-CveErrataAge.ps1 -AllProducts
+
+.NOTES
+    Source     : Red Hat Security Data API (public, no auth)
+    Compatible : Windows PowerShell 5.1 and PowerShell 7+
+
+.LINK
+    https://access.redhat.com/documentation/en-us/red_hat_security_data_api/1.0/html-single/red_hat_security_data_api/index
+
+.LINK
+    https://access.redhat.com/security/data
+
+.LINK
+    https://access.redhat.com/security/updates/classification/
+
+.LINK
+    https://www.redhat.com/en/blog/csaf-vex-documents-now-generally-available
+
+.LINK
+    https://docs.oasis-open.org/csaf/csaf/v2.0/csaf-v2.0.html
+#>
+
+#Requires -Version 5.1
+[CmdletBinding()]
+param(
+    [Parameter(ValueFromPipeline, ValueFromPipelineByPropertyName, Position = 0)]
+    [Alias('CVE')]
+    [string[]]$CveId,
+
+    [string]$InputFile,
+
+    [string]$Product = 'Red Hat Enterprise Linux 9',
+
+    [switch]$AllProducts,
+
+    [string]$OutputCsv = '.\cve-errata-report.csv',
+
+    [int]$ThrottleMs = 150
+)
+
+begin {
+    $ErrorActionPreference = 'Stop'
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+
+    # --- shared config (helpers below read these from script scope) ----------
+    $ApiBase     = 'https://access.redhat.com/hydra/rest/securitydata'
+    $UserAgent   = 'CveErrataAge/2.0 (PowerShell vulnerability triage)'
+    $Now         = [datetimeoffset]::UtcNow
+    $ErrataCache = @{}
+    $Collected   = [System.Collections.Generic.List[string]]::new()
+    $CveRegex    = [regex]'CVE-\d{4}-\d{3,}'
+
+    # --- helpers -------------------------------------------------------------
+
+    # Refs: CVE ID syntax (CVE-YYYY-NNNN, 4+ digits) https://www.cve.org/ResourcesSupport/FAQs
+    #       .NET Regex.Matches https://learn.microsoft.com/dotnet/api/system.text.regularexpressions.regex.matches
+    function Add-CveTokens([string]$Text) {
+        if ($Text) { foreach ($m in $CveRegex.Matches($Text)) { $Collected.Add($m.Value.ToUpper()) } }
+    }
+
+    # Refs: DateTimeOffset.Parse https://learn.microsoft.com/dotnet/api/system.datetimeoffset.parse
+    #       CSAF dates are RFC 3339 / ISO 8601 https://docs.oasis-open.org/csaf/csaf/v2.0/csaf-v2.0.html
+    function ConvertTo-Date([string]$Value) {
+        if (-not $Value) { return $null }
+        try { [datetimeoffset]::Parse($Value) } catch { $null }
+    }
+
+    # Refs: PowerShell -like / wildcards https://learn.microsoft.com/powershell/module/microsoft.powershell.core/about/about_comparison_operators
+    #       Red Hat product names & CPE dictionary https://access.redhat.com/security/data
+    function Test-InScope([string]$ProductName) {
+        if ($AllProducts) { return $true }
+        "$ProductName" -like "*$Product*"
+    }
+
+    # Build a result row with every column defaulted, then apply overrides.
+    # Refs: ordered hashtables https://learn.microsoft.com/powershell/module/microsoft.powershell.core/about/about_hash_tables
+    #       PSCustomObject https://learn.microsoft.com/powershell/module/microsoft.powershell.core/about/about_pscustomobject
+    function New-Row([hashtable]$Set) {
+        $row = [ordered]@{
+            CVE = ''; ErrataAvailable = ''; Errata = ''; ErrataSeverity = ''
+            ErrataSynopsis = ''; ErrataDescription = ''; ReleaseDate = ''; DaysSinceRelease = ''
+            Product = ''; FixedPackage = ''; VendorSeverity = ''; VendorCritical = ''
+            FixState = ''; CveUrl = ''
+        }
+        foreach ($k in $Set.Keys) { $row[$k] = $Set[$k] }
+        [pscustomobject]$row
+    }
+
+    # GET with retry/backoff. 404 -> throws 'NotFound'.
+    # Refs: Security Data API overview (base URL, formats, gzip) https://access.redhat.com/documentation/en-us/red_hat_security_data_api/1.0/html-single/red_hat_security_data_api/index
+    #       Invoke-RestMethod https://learn.microsoft.com/powershell/module/microsoft.powershell.utility/invoke-restmethod
+    #       HTTP 429 Too Many Requests / Retry-After https://developer.mozilla.org/docs/Web/HTTP/Status/429
+    function Invoke-RhSecApi([string]$Uri, [int]$MaxRetries = 5) {
+        $headers = @{ 'User-Agent' = $UserAgent; 'Accept' = 'application/json' }
+        for ($attempt = 1; ; $attempt++) {
+            try { return Invoke-RestMethod -Uri $Uri -Headers $headers -ErrorAction Stop }
+            catch {
+                $status = $null
+                if ($_.Exception.Response) { try { $status = [int]$_.Exception.Response.StatusCode } catch { } }
+                if ($status -eq 404) { throw 'NotFound' }
+
+                $retryable = ($status -eq 429) -or ($status -ge 500)
+                if (-not $retryable -or $attempt -gt $MaxRetries) { throw }
+
+                $wait = if ($status -eq 429) { 5 * $attempt } else { [int][Math]::Min(30, [Math]::Pow(2, $attempt)) }
+                Write-Warning "HTTP $status (attempt $attempt/$MaxRetries); retrying in ${wait}s..."
+                Start-Sleep -Seconds $wait
+            }
+        }
+    }
+
+    # Errata metadata from the CSAF advisory document (cached per RHSA).
+    # Refs: CSAF endpoint, Red Hat Security Data API https://access.redhat.com/documentation/en-us/red_hat_security_data_api/1.0/html-single/red_hat_security_data_api/index
+    #       Red Hat CSAF/VEX (replaces deprecated CVRF) https://www.redhat.com/en/blog/csaf-vex-documents-now-generally-available
+    #       CSAF 2.0 schema: document.title / tracking / notes / aggregate_severity https://docs.oasis-open.org/csaf/csaf/v2.0/csaf-v2.0.html
+    function Get-ErrataDetail([string]$Rhsa) {
+        if ($ErrataCache.ContainsKey($Rhsa)) { return $ErrataCache[$Rhsa] }
+
+        $info = [pscustomobject]@{ Severity = ''; Synopsis = ''; Description = ''; ReleaseDate = $null }
+        try {
+            if ($ThrottleMs -gt 0) { Start-Sleep -Milliseconds $ThrottleMs }
+            $doc = (Invoke-RhSecApi "$ApiBase/csaf/$Rhsa.json").document
+            if ($doc) {
+                $info.Severity    = "$($doc.aggregate_severity.text)"
+                $info.Synopsis    = ("$($doc.title)" -replace '^\s*Red Hat Security Advisory:\s*', '').Trim()
+                $info.ReleaseDate = ConvertTo-Date $doc.tracking.initial_release_date
+
+                $note = $doc.notes | Where-Object { "$($_.title)" -match '^(Topic|Description|Details)$' } | Select-Object -First 1
+                if (-not $note) { $note = $doc.notes | Where-Object { $_.category -in 'summary', 'description', 'general' } | Select-Object -First 1 }
+                $info.Description = (("$($note.text)") -replace '\s+', ' ').Trim()
+                if (-not $info.Description) { $info.Description = $info.Synopsis }
+            }
+        }
+        catch { Write-Warning "Could not fetch CSAF for $Rhsa : $_" }
+
+        $ErrataCache[$Rhsa] = $info
+        $info
+    }
+
+    # Resolve a single CVE into one or more result rows.
+    # Refs: CVE endpoint fields (affected_release, package_state, threat_severity) https://access.redhat.com/documentation/en-us/red_hat_security_data_api/1.0/html-single/red_hat_security_data_api/index
+    #       Red Hat severity ratings (threat_severity) https://access.redhat.com/security/updates/classification/
+    #       Worked query examples (advisory / CVE) https://access.redhat.com/documentation/en-us/red_hat_security_data_api/1.0/html/red_hat_security_data_api/example_script
+    function Resolve-Cve([string]$Cve) {
+        $url = "https://access.redhat.com/security/cve/$Cve"
+
+        try { $detail = Invoke-RhSecApi "$ApiBase/cve/$Cve.json" }
+        catch {
+            $msg = if ("$_" -match 'NotFound') { 'CVE not found' } else { "Error: $_" }
+            return New-Row @{ CVE = $Cve; ErrataAvailable = $msg; CveUrl = $url }
+        }
+
+        $vendorSev = "$($detail.threat_severity)"
+        $critical  = [bool]($vendorSev -match '^(?i)critical$')
+
+        $releases = @($detail.affected_release) | Where-Object { $_ -and (Test-InScope $_.product_name) -and $_.advisory }
+
+        # No errata for this product -> report the package_state fix_state instead.
+        if (-not $releases) {
+            $states = @($detail.package_state) | Where-Object { $_ -and (Test-InScope $_.product_name) }
+            $fix    = (@($states.fix_state) | Where-Object { $_ } | Select-Object -Unique) -join '; '
+            return New-Row @{
+                CVE = $Cve; ErrataAvailable = 'No'; VendorSeverity = $vendorSev; VendorCritical = $critical
+                FixState = $fix; Product = $(if ($AllProducts) { '' } else { $Product }); CveUrl = $url
+            }
+        }
+
+        # One row per RHSA that fixes this CVE.
+        foreach ($group in ($releases | Group-Object advisory)) {
+            $errata  = Get-ErrataDetail $group.Name
+            $relDate = $errata.ReleaseDate
+            if (-not $relDate) {
+                $fromCve = ($group.Group | Where-Object { $_.release_date } | Select-Object -First 1).release_date
+                $relDate = ConvertTo-Date $fromCve
+            }
+
+            New-Row @{
+                CVE               = $Cve
+                ErrataAvailable   = 'Yes'
+                Errata            = $group.Name
+                ErrataSeverity    = $errata.Severity
+                ErrataSynopsis    = $errata.Synopsis
+                ErrataDescription = $errata.Description
+                ReleaseDate       = $(if ($relDate) { $relDate.ToString('yyyy-MM-dd') } else { '' })
+                DaysSinceRelease  = $(if ($relDate) { [int][Math]::Floor(($Now - $relDate).TotalDays) } else { '' })
+                Product           = (@($group.Group.product_name) | Select-Object -Unique) -join '; '
+                FixedPackage      = (@($group.Group.package) | Where-Object { $_ } | Select-Object -Unique) -join '; '
+                VendorSeverity    = $vendorSev
+                VendorCritical    = $critical
+                CveUrl            = $url
+            }
+        }
+    }
+
+    # Seed CVEs from the input file, if given.
+    if ($InputFile) {
+        if (-not (Test-Path -LiteralPath $InputFile)) { throw "Input file not found: $InputFile" }
+        Add-CveTokens (Get-Content -LiteralPath $InputFile -Raw)
+    }
+}
+
+process {
+    if ($CveId) { foreach ($c in $CveId) { Add-CveTokens $c } }
+}
+
+end {
+    $cves = $Collected | Select-Object -Unique
+    if (-not $cves) { throw "No CVEs supplied. Use -CveId, -InputFile, or pipe CVE IDs in." }
+
+    Write-Host "Resolving errata for $($cves.Count) CVE(s)..." -ForegroundColor Cyan
+    if (-not $AllProducts) { Write-Host "Scoped to product: $Product (use -AllProducts to widen)" -ForegroundColor DarkCyan }
+
+    $results = [System.Collections.Generic.List[object]]::new()
+    $i = 0
+    foreach ($cve in $cves) {
+        $i++
+        Write-Progress -Activity 'Resolving errata' -Status "$cve ($i of $($cves.Count))" -PercentComplete ($i / $cves.Count * 100)
+        if ($ThrottleMs -gt 0) { Start-Sleep -Milliseconds $ThrottleMs }
+        foreach ($row in (Resolve-Cve $cve)) { $results.Add($row) }
+    }
+    Write-Progress -Activity 'Resolving errata' -Completed
+
+    $results | Export-Csv -LiteralPath $OutputCsv -NoTypeInformation -Encoding UTF8
+
+    # --- summary -------------------------------------------------------------
+    $withErrata = @($results | Where-Object ErrataAvailable -eq 'Yes').Count
+    $noErrata   = @($results | Where-Object ErrataAvailable -eq 'No').Count
+    $notFound   = $results.Count - $withErrata - $noErrata
+    $critical   = @($results | Where-Object { $_.VendorCritical -eq $true } | Select-Object -ExpandProperty CVE -Unique).Count
+
+    Write-Host ""
+    Write-Host "==================== SUMMARY ====================" -ForegroundColor Green
+    Write-Host ("Input CVEs        : {0}" -f $cves.Count)
+    Write-Host ("Vendor Critical   : {0}" -f $critical) -ForegroundColor $(if ($critical) { 'Red' } else { 'Green' })
+    Write-Host ("Output rows       : {0} (one per CVE-per-RHSA)" -f $results.Count)
+    Write-Host ("Errata available  : {0}" -f $withErrata) -ForegroundColor Green
+    Write-Host ("No errata in scope: {0}" -f $noErrata) -ForegroundColor $(if ($noErrata) { 'Yellow' } else { 'Green' })
+    if ($notFound) { Write-Host ("Not found / error : {0}" -f $notFound) -ForegroundColor Yellow }
+    Write-Host ("CSV written       : {0}" -f $OutputCsv) -ForegroundColor Cyan
+    Write-Host "=================================================" -ForegroundColor Green
+    Write-Host ""
+
+    $results
+}
