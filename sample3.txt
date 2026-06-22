@@ -68,7 +68,7 @@
 #>
 
 #Requires -Version 5.1
-[CmdletBinding()]
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [Parameter(ValueFromPipeline, ValueFromPipelineByPropertyName, Position = 0)]
     [Alias('CVE')]
